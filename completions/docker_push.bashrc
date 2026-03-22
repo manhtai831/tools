@@ -52,8 +52,10 @@ _docker_tool_complete() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     case "${prev}" in
-    -t)
-        COMPREPLY=($(compgen -W "latest" -- "${cur}"))
+    -i)
+        local images
+        images="$(_docker_push_images)"
+        COMPREPLY=($(compgen -W "${images}" -- "${cur}"))
         return
         ;;
     -f|-o)
@@ -63,7 +65,7 @@ _docker_tool_complete() {
     esac
 
     if [[ "${cur}" == -* ]]; then
-        COMPREPLY=($(compgen -W "-i -t -o -f -u -h" -- "${cur}"))
+        COMPREPLY=($(compgen -W "-i -o -f -u -U -h" -- "${cur}"))
         return
     fi
 }

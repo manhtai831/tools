@@ -5,18 +5,15 @@ set -euo pipefail
 usage() {
 	cat <<'EOF'
 Usage:
-	./bundle.sh [-i image_name] [-t image_tag]... [-o dockerfile_dir] [-f dockerfile_path] [-u]
-	./bundle.sh [-i image_name] [-t image_tag1,image_tag2,...] [-o dockerfile_dir] [-f dockerfile_path] [-u]
-	./bundle.sh [image_name] [image_tag1,image_tag2,...] [dockerfile_dir] [dockerfile_path]  # legacy positional
+	docker_tool [-i image_name:tag]... [-o dockerfile_dir] [-f dockerfile_path] [-u] [-U url]
 
 Example:
-	./bundle.sh -i myapp,myapp_2 -t 1.0.0 -t stable -o . -f Dockerfile -u
-	./bundle.sh myapp 1.0.0,stable . Dockerfile
-	./bundle.sh                    # image_name=fallback theo thu muc hien tai, image_tag=latest (+ commit id neu co)
+	docker_tool -i myapp:1.0.0 -o . -f Dockerfile
+	docker_tool -i myapp:1.0.0 -i myapp:stable -o . -f Dockerfile -u -U https://example.com/api/upload
+	docker_tool                    # image_name=current dir, tag=latest (+ commit id if in git repo)
 
 Options:
-	-i  Image name (default: current directory name)
-	-t  Image tag, can be repeated (default: latest)
+	-i  Image reference as name:tag, can be repeated for multiple tags (default: <current dir>:latest)
 	-o  Docker build context directory (default: .)
 	-f  Dockerfile path (default: Dockerfile)
 	-u  Upload image archive to API after saving (default: off)
@@ -111,16 +108,6 @@ add_tag() {
 	TAGS+=("${tag}")
 }
 
-add_tags_from_csv() {
-	local csv="$1"
-	local piece=""
-
-	IFS=',' read -r -a _parsed_tags <<< "${csv}"
-	for piece in "${_parsed_tags[@]}"; do
-		add_tag "${piece}"
-	done
-}
-
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 	usage
 	exit 0
@@ -130,18 +117,20 @@ IMAGE_NAME=""
 DOCKERFILE_DIR="."
 DOCKERFILE_PATH="Dockerfile"
 TAGS=()
-TAG_OPTIONS_USED=0
 DO_UPLOAD=0
 UPLOAD_URL="${DOCKER_TOOL_UPLOAD_URL:-}"
 
-while getopts ":i:t:o:f:uU:h" opt; do
+while getopts ":i:o:f:uU:h" opt; do
 	case "${opt}" in
 	i)
-		IMAGE_NAME="${OPTARG}"
-		;;
-	t)
-		TAG_OPTIONS_USED=1
-		add_tags_from_csv "${OPTARG}"
+		if [[ "${OPTARG}" == *:* ]]; then
+			if [[ -z "${IMAGE_NAME}" ]]; then
+				IMAGE_NAME="${OPTARG%:*}"
+			fi
+			add_tag "${OPTARG##*:}"
+		else
+			IMAGE_NAME="${OPTARG}"
+		fi
 		;;
 	o)
 		DOCKERFILE_DIR="${OPTARG}"
@@ -184,24 +173,8 @@ if [[ -z "${IMAGE_NAME}" && -n "${1:-}" ]]; then
 	IMAGE_NAME="${1}"
 fi
 
-if [[ ${TAG_OPTIONS_USED} -eq 0 ]]; then
-	if [[ -n "${2:-}" ]]; then
-		add_tags_from_csv "${2}"
-	else
-		add_tag "latest"
-	fi
-fi
-
 if [[ ${#TAGS[@]} -eq 0 ]]; then
 	add_tag "latest"
-fi
-
-if [[ "${DOCKERFILE_DIR}" == "." && -n "${3:-}" ]]; then  # legacy positional
-	DOCKERFILE_DIR="${3}"
-fi
-
-if [[ "${DOCKERFILE_PATH}" == "Dockerfile" && -n "${4:-}" ]]; then
-	DOCKERFILE_PATH="${4}"
 fi
 
 if [[ -z "${IMAGE_NAME}" ]]; then

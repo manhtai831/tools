@@ -54,15 +54,14 @@ source ~/.bashrc  # bash
 Build a Docker image, tag it with one or more tags, save it as a `.tar.gz` archive, and optionally upload it to an HTTP API.
 
 ```
-docker_tool [-i image_name] [-t tag]... [-o build_context] [-f dockerfile] [-u] [-U url]
+docker_tool [-i image_name:tag]... [-o build_context] [-f dockerfile] [-u] [-U url]
 ```
 
 ### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-i <name>` | current directory name | Image name. Can be a comma-separated list for multiple image names. |
-| `-t <tag>` | `latest` | Tag to apply. Can be repeated (`-t 1.0.0 -t stable`) or comma-separated (`-t 1.0.0,stable`). |
+| `-i <name:tag>` | `<current directory>:latest` | Image reference as `name:tag`. Can be repeated for multiple tags (`-i myapp:1.0.0 -i myapp:stable`). If no tag is given, defaults to `latest`. |
 | `-o <dir>` | `.` | Docker build context directory. |
 | `-f <path>` | `Dockerfile` | Path to the Dockerfile (absolute or relative to `-o`). |
 | `-u` | off | Enable upload of the archive to an API after saving. |
@@ -85,15 +84,18 @@ The script runs five steps:
 # Build using defaults (image name = current dir, tag = latest)
 docker_tool
 
-# Build with explicit name and tags
-docker_tool -i myapp -t 1.0.0 -t stable -o . -f Dockerfile
+# Build with explicit name and tag
+docker_tool -i myapp:1.0.0 -o . -f Dockerfile
+
+# Build with multiple tags
+docker_tool -i myapp:1.0.0 -i myapp:stable -o . -f Dockerfile
 
 # Build and upload
-docker_tool -i myapp -t 1.0.0 -u -U https://files.example.com/api/upload
+docker_tool -i myapp:1.0.0 -u -U https://files.example.com/api/upload
 
 # Use environment variable for upload URL
 export DOCKER_TOOL_UPLOAD_URL=https://files.example.com/api/upload
-docker_tool -i myapp -t 1.0.0 -u
+docker_tool -i myapp:1.0.0 -u
 ```
 
 ---

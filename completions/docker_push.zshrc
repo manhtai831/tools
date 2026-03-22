@@ -38,18 +38,18 @@ _docker_tool() {
     typeset -A opt_args
 
     _arguments -s \
-        '-i[Image name]:image_name:' \
-        '-t[Image tag (repeatable)]:image_tag:->image_tag' \
+        '*-i[Image reference as name:tag (repeatable)]:image_ref:->image_ref' \
         '-o[Docker build context directory]:dir:_files -/' \
         '-f[Dockerfile path]:dockerfile:_files' \
         '-u[Upload image archive to API after saving]' \
+        '-U[Upload API URL]:url:' \
         '-h[Show help]'
 
     case $state in
-    image_tag)
+    image_ref)
         local images
-        images=(${(f)"$(docker images --format '{{.Tag}}' 2>/dev/null | grep -v '<none>' | sort -u)"})
-        _describe 'image tags' images
+        images=(${(f)"$(_docker_push_images)"})
+        _describe 'docker images' images
         ;;
     esac
 }
