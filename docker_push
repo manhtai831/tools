@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+	cat <<'EOF'
+Usage:
+	docker_push -m <method> -i <image_ref> [options]
+
+Methods:
+	aws     Push to AWS ECR
+	ghcr    Push to GitHub Container Registry (ghcr.io)
+	scp     Copy image archive to remote server via SCP
+
+Common options:
+	-m  Push method: aws | ghcr | scp  (required)
+	-i  Full image reference: <image_name>:<tag>  (required)
+	    For aws:  <registry>/<repo>:<tag>  e.g. 123456789.dkr.ecr.ap-southeast-1.amazonaws.com/myapp:latest
+	    For ghcr: ghcr.io/<user>/<repo>:<tag>      e.g. ghcr.io/myuser/myapp:1.0.0
+	    For scp:  <image_name>:<tag>               e.g. myapp:latest
+	-h  Show help
+
+AWS ECR options:
+	-R  AWS region         (default: inferred from registry URL or $AWS_DEFAULT_REGION)
+	-A  AWS Access Key ID  (or set $AWS_ACCESS_KEY_ID)
+	-S  AWS Secret Key     (or set $AWS_SECRET_ACCESS_KEY)
+
+GHCR options:
+	-g  GitHub username   (or set $GHCR_USER)
+	-k  GitHub token      (or set $GHCR_TOKEN)
+
+SCP options:
+	-H  Remote host                    (required)
+	-U  Remote user                    (default: current user)
+	-p  Remote destination path        (default: ~)
+	-P  SSH port                       (default: 22)
+	-K  SSH private key path           (optional)
+
+Environment variables:
+	GHCR_USER              GitHub username for GHCR
+	GHCR_TOKEN             GitHub personal access token for GHCR
+	AWS_ACCESS_KEY_ID      AWS access key for ECR
+	AWS_SECRET_ACCESS_KEY  AWS secret key for ECR
+	AWS_PROFILE            AWS CLI profile to use
+	AWS_DEFAULT_REGION
+
+Examples:
+	docker_push -m aws  -i 123456789.dkr.ecr.ap-southeast-1.amazonaws.com/myapp:latest
+	docker_push -m aws  -i 123456789.dkr.ecr.ap-southeast-1.amazonaws.com/myapp:latest -A AKIAIOSFODNN7 -S wJalrXUtnFEMI
+	docker_push -m ghcr -i ghcr.io/myuser/myapp:1.0.0 -g myuser -k ghp_xxxx
+	docker_push -m scp  -i myapp:latest -H 192.168.1.10 -U ubuntu -p /opt/images -K ~/.ssh/id_rsa
+EOF
+}
+
+require_cmd() {
+	local cmd="$1"
+	if ! command -v "$cmd" >/dev/null 2>&1; then
+		echo "Error: required command not found: ${cmd}" >&2
+		exit 1
+	fi
+}
+
+add_tag() {
+	local tag="$1"
+	tag="${tag#"${tag%%[![:space:]]*}"}"
+	tag="${tag%"${tag##*[![:space:]]}"}"
+	[[ -z "${tag}" ]] && return 0
+	local existing
+	for existing in "${TAGS[@]:-}"; do
+		[[ "${existing}" == "${tag}" ]] && return 0
+	done
+	TAGS+=("${tag}")
+}
+
+add_tags_from_csv() {
+	local csv="$1" piece=""
+	IFS=',' read -r -a _parsed <<< "${csv}"
+	for piece in "${_parsed[@]}"; do add_tag "${piece}"; done
+}
+
+# ─── Parse args ──────────────────────────────────────────────────────────────
+
+METHOD=""
+IMAGE_REF=""
+
+# AWS
+AWS_REGION="${AWS_DEFAULT_REGION:-}"
+AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
+AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
+
+# GHCR
+GHCR_USER="${GHCR_USER:-}"
+GHCR_TOKEN="${GHCR_TOKEN:-}"
+
+# SCP
+REMOTE_HOST=""
+REMOTE_USER="$(id -un)"
+REMOTE_PATH="~"
+REMOTE_PORT="22"
+SSH_KEY=""
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+	usage; exit 0
+fi
+
+while getopts ":m:i:R:A:S:g:k:H:U:p:P:K:h" opt; do
+	case "${opt}" in
+	m) METHOD="${OPTARG}" ;;
+	i) IMAGE_REF="${OPTARG}" ;;
+	R) AWS_REGION="${OPTARG}" ;;
+	A) AWS_ACCESS_KEY_ID="${OPTARG}" ;;
+	S) AWS_SECRET_ACCESS_KEY="${OPTARG}" ;;
+	g) GHCR_USER="${OPTARG}" ;;
+	k) GHCR_TOKEN="${OPTARG}" ;;
+	H) REMOTE_HOST="${OPTARG}" ;;
+	U) REMOTE_USER="${OPTARG}" ;;
+	p) REMOTE_PATH="${OPTARG}" ;;
+	P) REMOTE_PORT="${OPTARG}" ;;
+	K) SSH_KEY="${OPTARG}" ;;
+	h) usage; exit 0 ;;
+	:) echo "Error: option -${OPTARG} requires a value." >&2; usage; exit 1 ;;
+	\?) echo "Error: invalid option -${OPTARG}" >&2; usage; exit 1 ;;
+	esac
+done
+
+# ─── Validate common required args ───────────────────────────────────────────
+
+if [[ -z "${METHOD}" ]]; then
+	echo "Error: -m <method> is required." >&2; usage; exit 1
+fi
+
+if [[ -z "${IMAGE_REF}" ]]; then
+	echo "Error: -i <image_ref> is required." >&2; usage; exit 1
+fi
+
+# Parse image name (without tag) and tag from IMAGE_REF
+if [[ "${IMAGE_REF}" == *:* ]]; then
+	IMAGE_TAG="${IMAGE_REF##*:}"
+	IMAGE_BASE="${IMAGE_REF%:*}"
+else
+	IMAGE_TAG="latest"
+	IMAGE_BASE="${IMAGE_REF}"
+fi
+
+PRIMARY_TAG="${IMAGE_TAG}"
+
+# ─── Method: AWS ECR ─────────────────────────────────────────────────────────
+
+push_aws() {
+	require_cmd docker
+	require_cmd aws
+
+	# Extract registry: everything before the first /
+	local ECR_REGISTRY="${IMAGE_BASE%%/*}"
+	if [[ -z "${ECR_REGISTRY}" || "${ECR_REGISTRY}" == "${IMAGE_BASE}" ]]; then
+		echo "Error: -i must include the ECR registry for method aws." >&2
+		echo "       e.g. -i 123456789.dkr.ecr.ap-southeast-1.amazonaws.com/myapp:latest" >&2
+		exit 1
+	fi
+
+	# Infer region from registry URL if not provided
+	if [[ -z "${AWS_REGION}" ]]; then
+		AWS_REGION="$(echo "${ECR_REGISTRY}" | sed -n 's/.*\.dkr\.ecr\.\([^.]*\)\.amazonaws\.com.*/\1/p')"
+	fi
+	if [[ -z "${AWS_REGION}" ]]; then
+		echo "Error: could not infer AWS region. Pass -R <region> or set AWS_DEFAULT_REGION." >&2; exit 1
+	fi
+
+	echo "=> Authenticating with ECR (region: ${AWS_REGION})"
+
+	# Export credentials if provided explicitly, so aws CLI picks them up.
+	if [[ -n "${AWS_ACCESS_KEY_ID}" && -n "${AWS_SECRET_ACCESS_KEY}" ]]; then
+		export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+	elif [[ -z "$(aws configure list-profiles 2>/dev/null)" && -z "${AWS_PROFILE:-}" ]]; then
+		echo "Warning: no AWS credentials found. Pass -A/-S, set env vars, or run 'aws configure'." >&2
+	fi
+
+	aws ecr get-login-password --region "${AWS_REGION}" \
+		| docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+	echo "=> Pushing: ${IMAGE_REF}"
+	docker push "${IMAGE_REF}"
+
+	# Unset credentials from environment after use.
+	unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+
+	echo "Done. Pushed ${IMAGE_REF} to ECR."
+}
+
+# ─── Method: GHCR ────────────────────────────────────────────────────────────
+
+push_ghcr() {
+	require_cmd docker
+
+	if [[ -z "${GHCR_USER}" ]]; then
+		echo "Error: GitHub username required. Pass -g <user> or set GHCR_USER." >&2; exit 1
+	fi
+	if [[ -z "${GHCR_TOKEN}" ]]; then
+		echo "Error: GitHub token required. Pass -k <token> or set GHCR_TOKEN." >&2; exit 1
+	fi
+
+	echo "=> Authenticating with ghcr.io as ${GHCR_USER}"
+	echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin
+
+	echo "=> Pushing: ${IMAGE_REF}"
+	docker push "${IMAGE_REF}"
+
+	echo "Done. Pushed ${IMAGE_REF} to ghcr.io."
+}
+
+# ─── Method: SCP ─────────────────────────────────────────────────────────────
+
+push_scp() {
+	require_cmd docker
+	require_cmd ssh
+	require_cmd scp
+
+	if [[ -z "${REMOTE_HOST}" ]]; then
+		echo "Error: -H <remote_host> is required for method scp." >&2; exit 1
+	fi
+
+	local archive="${IMAGE_BASE##*/}_${IMAGE_TAG}.tar.gz"
+
+	# Build SSH/SCP common options
+	local ssh_opts="-p ${REMOTE_PORT} -o StrictHostKeyChecking=no -o BatchMode=yes"
+	local scp_opts="-P ${REMOTE_PORT} -o StrictHostKeyChecking=no -o BatchMode=yes"
+	if [[ -n "${SSH_KEY}" ]]; then
+		ssh_opts="${ssh_opts} -i ${SSH_KEY}"
+		scp_opts="${scp_opts} -i ${SSH_KEY}"
+	fi
+
+	local image_ref="${IMAGE_REF}"
+
+	# Check if archive already exists from docker_tool run
+	if [[ ! -f "${archive}" ]]; then
+		require_cmd pv
+		require_cmd gzip
+		echo "=> Saving image ${image_ref} to ${archive}"
+		local size_bytes
+		size_bytes="$(docker image inspect "${image_ref}" --format '{{.Size}}')"
+		size_bytes=$(( size_bytes * 110 / 100 ))
+		docker image save "${image_ref}" | pv -s "${size_bytes}" | gzip > "${archive}"
+	else
+		echo "=> Using existing archive: ${archive}"
+	fi
+
+	local dest="${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}/"
+	echo "=> Ensuring remote path exists: ${REMOTE_PATH}"
+	# shellcheck disable=SC2086
+	ssh ${ssh_opts} "${REMOTE_USER}@${REMOTE_HOST}" "mkdir -p ${REMOTE_PATH}"
+	echo "=> Uploading ${archive} -> ${dest}"
+	# shellcheck disable=SC2086
+	scp ${scp_opts} "${archive}" "${dest}"
+
+	echo "=> Verifying file on remote"
+	# shellcheck disable=SC2086
+	ssh ${ssh_opts} "${REMOTE_USER}@${REMOTE_HOST}" "ls -lh ${REMOTE_PATH}/${archive}"
+
+	echo "Done. Archive uploaded to ${REMOTE_HOST}:${REMOTE_PATH}/${archive}"
+	echo "To load on remote: docker load -i ${REMOTE_PATH}/${archive}"
+}
+
+# ─── Dispatch ────────────────────────────────────────────────────────────────
+
+case "${METHOD}" in
+aws)  push_aws ;;
+ghcr) push_ghcr ;;
+scp)  push_scp ;;
+*)
+	echo "Error: unknown method '${METHOD}'. Must be one of: aws, ghcr, scp." >&2
+	usage; exit 1
+	;;
+esac

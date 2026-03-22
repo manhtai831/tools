@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+	cat <<'EOF'
+Usage:
+	./bundle.sh [-i image_name] [-t image_tag]... [-o dockerfile_dir] [-f dockerfile_path] [-u]
+	./bundle.sh [-i image_name] [-t image_tag1,image_tag2,...] [-o dockerfile_dir] [-f dockerfile_path] [-u]
+	./bundle.sh [image_name] [image_tag1,image_tag2,...] [dockerfile_dir] [dockerfile_path]  # legacy positional
+
+Example:
+	./bundle.sh -i myapp,myapp_2 -t 1.0.0 -t stable -o . -f Dockerfile -u
+	./bundle.sh myapp 1.0.0,stable . Dockerfile
+	./bundle.sh                    # image_name=fallback theo thu muc hien tai, image_tag=latest (+ commit id neu co)
+
+Options:
+	-i  Image name (default: current directory name)
+	-t  Image tag, can be repeated (default: latest)
+	-o  Docker build context directory (default: .)
+	-f  Dockerfile path (default: Dockerfile)
+	-u  Upload image archive to API after saving (default: off)
+	-U  Upload API URL (required when -u is set, or set $DOCKER_TOOL_UPLOAD_URL)
+	-h  Show help
+
+Dockerfile behavior:
+	- If -f is not provided, script uses Dockerfile.
+	- Script checks Dockerfile in current directory first, then in -o directory.
+	- If Dockerfile is still not found, script exits with an explicit error.
+
+Outputs:
+	- Build image: <image_name>:build-<timestamp>
+	- Tag image:   <image_name>:<image_tag> (one or many tags)
+	- Save file:   <image_name>_<primary_tag>_<timestamp>.tar.gz
+	- Upload API:  <url passed via -U or $DOCKER_TOOL_UPLOAD_URL>
+	- Extracted filename from response JSON
+EOF
+}
+
+require_cmd() {
+	local cmd="$1"
+	if ! command -v "$cmd" >/dev/null 2>&1; then
+		echo "Error: required command not found: $cmd" >&2
+		exit 1
+	fi
+}
+
+require_pv() {
+	if command -v pv >/dev/null 2>&1; then
+		return 0
+	fi
+
+	echo "Error: required command not found: pv" >&2
+	case "$(uname -s)" in
+	Darwin)
+		echo "Install on macOS: brew install pv" >&2
+		;;
+	Linux)
+		echo "Install on Ubuntu: sudo apt update && sudo apt install -y pv" >&2
+		;;
+	*)
+		echo "Please install pv using your OS package manager." >&2
+		;;
+	esac
+	exit 1
+}
+
+resolve_dockerfile() {
+	if [[ "${DOCKERFILE_PATH}" = /* ]]; then
+		if [[ -f "${DOCKERFILE_PATH}" ]]; then
+			printf '%s\n' "${DOCKERFILE_PATH}"
+			return 0
+		fi
+	else
+		if [[ -f "${DOCKERFILE_PATH}" ]]; then
+			printf '%s\n' "${DOCKERFILE_PATH}"
+			return 0
+		fi
+		if [[ -f "${DOCKERFILE_DIR%/}/${DOCKERFILE_PATH}" ]]; then
+			printf '%s\n' "${DOCKERFILE_DIR%/}/${DOCKERFILE_PATH}"
+			return 0
+		fi
+	fi
+
+	echo "Error: Dockerfile not found." >&2
+	echo "Checked paths:" >&2
+	echo "- ${DOCKERFILE_PATH}" >&2
+	echo "- ${DOCKERFILE_DIR%/}/${DOCKERFILE_PATH}" >&2
+	echo "Tip: pass dockerfile path with -f, or place Dockerfile in current directory." >&2
+	exit 1
+}
+
+add_tag() {
+	local tag="$1"
+	local existing=""
+
+	# Trim leading/trailing spaces.
+	tag="${tag#"${tag%%[![:space:]]*}"}"
+	tag="${tag%"${tag##*[![:space:]]}"}"
+
+	if [[ -z "${tag}" ]]; then
+		return 0
+	fi
+
+	for existing in "${TAGS[@]:-}"; do
+		if [[ "${existing}" == "${tag}" ]]; then
+			return 0
+		fi
+	done
+
+	TAGS+=("${tag}")
+}
+
+add_tags_from_csv() {
+	local csv="$1"
+	local piece=""
+
+	IFS=',' read -r -a _parsed_tags <<< "${csv}"
+	for piece in "${_parsed_tags[@]}"; do
+		add_tag "${piece}"
+	done
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+	usage
+	exit 0
+fi
+
+IMAGE_NAME=""
+DOCKERFILE_DIR="."
+DOCKERFILE_PATH="Dockerfile"
+TAGS=()
+TAG_OPTIONS_USED=0
+DO_UPLOAD=0
+UPLOAD_URL="${DOCKER_TOOL_UPLOAD_URL:-}"
+
+while getopts ":i:t:o:f:uU:h" opt; do
+	case "${opt}" in
+	i)
+		IMAGE_NAME="${OPTARG}"
+		;;
+	t)
+		TAG_OPTIONS_USED=1
+		add_tags_from_csv "${OPTARG}"
+		;;
+	o)
+		DOCKERFILE_DIR="${OPTARG}"
+		;;
+	f)
+		DOCKERFILE_PATH="${OPTARG}"
+		;;
+	u)
+		DO_UPLOAD=1
+		;;
+	U)
+		UPLOAD_URL="${OPTARG}"
+		;;
+	h)
+		usage
+		exit 0
+		;;
+	:)
+		echo "Error: option -${OPTARG} requires a value." >&2
+		usage
+		exit 1
+		;;
+	\?)
+		echo "Error: invalid option -${OPTARG}" >&2
+		usage
+		exit 1
+		;;
+	esac
+done
+
+shift $((OPTIND - 1))
+
+if [[ $# -gt 4 ]]; then
+	echo "Error: too many positional arguments." >&2
+	usage
+	exit 1
+fi
+
+if [[ -z "${IMAGE_NAME}" && -n "${1:-}" ]]; then
+	IMAGE_NAME="${1}"
+fi
+
+if [[ ${TAG_OPTIONS_USED} -eq 0 ]]; then
+	if [[ -n "${2:-}" ]]; then
+		add_tags_from_csv "${2}"
+	else
+		add_tag "latest"
+	fi
+fi
+
+if [[ ${#TAGS[@]} -eq 0 ]]; then
+	add_tag "latest"
+fi
+
+if [[ "${DOCKERFILE_DIR}" == "." && -n "${3:-}" ]]; then  # legacy positional
+	DOCKERFILE_DIR="${3}"
+fi
+
+if [[ "${DOCKERFILE_PATH}" == "Dockerfile" && -n "${4:-}" ]]; then
+	DOCKERFILE_PATH="${4}"
+fi
+
+if [[ -z "${IMAGE_NAME}" ]]; then
+	IMAGE_NAME="$(basename "$PWD")"
+fi
+
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+	COMMIT_ID="$(git rev-parse --short HEAD 2>/dev/null || true)"
+	if [[ -n "${COMMIT_ID}" ]]; then
+		add_tag "${COMMIT_ID}"
+	fi
+fi
+
+PRIMARY_TAG="${TAGS[0]}"
+
+DOCKERFILE_RESOLVED="$(resolve_dockerfile)"
+
+TIMESTAMP="$(date +%Y%m%d%H%M%S)"
+BUILD_TAG="build-${TIMESTAMP}"
+FULL_BUILD_IMAGE="${IMAGE_NAME}:${BUILD_TAG}"
+FULL_TARGET_IMAGE="${IMAGE_NAME}:${PRIMARY_TAG}"
+ARCHIVE_FILE="${IMAGE_NAME}_${PRIMARY_TAG}.tar.gz"
+RESPONSE_FILE="upload_response_${TIMESTAMP}.json"
+
+require_cmd docker
+require_cmd curl
+require_pv
+require_cmd gzip
+
+echo "[1/5] Building Docker image: ${FULL_BUILD_IMAGE}"
+docker build -t "${FULL_BUILD_IMAGE}" -f "${DOCKERFILE_RESOLVED}" "${DOCKERFILE_DIR}"
+
+echo "[2/5] Tagging image with tags: ${TAGS[*]}"
+for tag in "${TAGS[@]}"; do
+	echo "  => Tagging: ${IMAGE_NAME}:${tag}"
+	docker tag "${FULL_BUILD_IMAGE}" "${IMAGE_NAME}:${tag}"
+done
+
+IMAGE_SIZE_BYTES="$(docker image inspect "${FULL_TARGET_IMAGE}" --format '{{.Size}}')"
+if [[ ! "${IMAGE_SIZE_BYTES}" =~ ^[0-9]+$ ]]; then
+	echo "Error: could not determine image size for pv progress" >&2
+	exit 1
+fi
+# Cong them 10% de bu phan TAR header + manifest overhead khi docker save
+IMAGE_SIZE_BYTES=$(( IMAGE_SIZE_BYTES * 110 / 100 ))
+
+echo "[3/5] Saving image to compressed archive: ${ARCHIVE_FILE}"
+# Stream image through pv for progress and gzip for compression.
+docker image save "${FULL_TARGET_IMAGE}" | pv -s "${IMAGE_SIZE_BYTES}" | gzip > "${ARCHIVE_FILE}"
+
+if [[ ${DO_UPLOAD} -eq 1 ]]; then
+	if [[ -z "${UPLOAD_URL}" ]]; then
+		echo "Error: upload URL required. Pass -U <url> or set DOCKER_TOOL_UPLOAD_URL." >&2
+		exit 1
+	fi
+	echo "[4/5] Uploading archive to API"
+	curl --fail --silent --show-error \
+		-X POST "${UPLOAD_URL}" \
+		-F "files=@${ARCHIVE_FILE}" \
+		-H "Accept: application/json" \
+		> "${RESPONSE_FILE}"
+
+	echo "[5/5] Extracting filename from response"
+	FILENAME="$(grep -m1 -o '"filename"[[:space:]]*:[[:space:]]*"[^"]*"' "${RESPONSE_FILE}" | sed 's/.*"filename"[[:space:]]*:[[:space:]]*"\([^"]*\)"/\1/')"
+
+	if [[ -z "${FILENAME}" ]]; then
+		echo "Error: could not extract filename from API response" >&2
+		echo "Response content:"
+		cat "${RESPONSE_FILE}"
+		rm -f "${RESPONSE_FILE}"
+		exit 1
+	fi
+
+	rm -f "${RESPONSE_FILE}"
+
+	echo "Extracted filename: ${FILENAME}"
+	echo "Download URL: ${UPLOAD_URL}/${FILENAME}"
+else
+	echo "[4/5] Skipping upload (use -u to enable)"
+	echo "[5/5] Skipping filename extraction"
+	echo "Archive saved at: ${ARCHIVE_FILE}"
+fi
